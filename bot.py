@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import io
 import json
 import logging
 import os
@@ -30,6 +29,7 @@ import sys
 import tempfile
 import time
 import zipfile
+from functools import lru_cache
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -144,9 +144,17 @@ def discover_users(library_root: str) -> list[str]:
 
 def library_base(cfg: dict) -> Path:
     """Parent dir that contains user dirs."""
-    root = Path(cfg["library_root"])
-    if any(p.is_dir() and re.fullmatch(r"\d{4}", p.name) for p in root.iterdir() if True):
-        return root.parent
+    return _cached_library_base(cfg["library_root"])
+
+
+@lru_cache(maxsize=8)
+def _cached_library_base(library_root: str) -> Path:
+    root = Path(library_root)
+    try:
+        if any(p.is_dir() and re.fullmatch(r"\d{4}", p.name) for p in root.iterdir()):
+            return root.parent
+    except OSError:
+        pass
     return root
 
 
@@ -155,10 +163,13 @@ def resolve_user_dir(cfg: dict, user_id: str) -> Path:
 
 
 def user_label(cfg: dict, user_id: str) -> str:
-    for alias, uid in cfg["aliases"].items():
-        if uid == user_id:
-            return alias
-    return user_id[:8]
+    rev = cfg.get("_alias_rev")
+    if rev is None:
+        rev = {}
+        for alias, uid in cfg["aliases"].items():
+            rev.setdefault(uid, alias)
+        cfg["_alias_rev"] = rev
+    return rev.get(user_id, user_id[:8])
 
 
 def resolve_user_selection(cfg: dict, users_arg: list[str], all_users: bool) -> list[str]:
@@ -240,16 +251,20 @@ def validate_period(args) -> str | None:
     if args.month:
         if not MONTH_RE.match(args.month):
             raise SystemExit(f"Bad --month '{args.month}', expected YYYY-MM")
-        try:
-            month = int(args.month[5:7])
-        except ValueError:
-            raise SystemExit(f"Bad --month '{args.month}', expected YYYY-MM")
-        if not 1 <= month <= 12:
+        if not 1 <= int(args.month[5:7]) <= 12:
             raise SystemExit(f"Bad --month '{args.month}', month must be 01-12")
     else:
         if not YEAR_RE.match(args.year):
             raise SystemExit(f"Bad --year '{args.year}', expected YYYY")
     return period
+
+
+def iter_day_dirs(year_dir: Path, prefix: str | None) -> list[Path]:
+    """Day dirs (YYYY-MM-DD) under a year dir, optionally filtered by prefix."""
+    return sorted(
+        p for p in year_dir.iterdir()
+        if p.is_dir() and DATE_RE.match(p.name) and (prefix is None or p.name.startswith(prefix))
+    )
 
 
 def collect_period_files(cfg: dict, user_id: str, period_s: str) -> list[Path]:
@@ -266,18 +281,8 @@ def collect_period_files(cfg: dict, user_id: str, period_s: str) -> list[Path]:
     year_dir = user_dir / year
     if not year_dir.is_dir():
         return []
-    if prefix is not None:
-        day_dirs = sorted(
-            p for p in year_dir.iterdir()
-            if p.is_dir() and p.name.startswith(prefix) and DATE_RE.match(p.name)
-        )
-    else:
-        day_dirs = sorted(
-            p for p in year_dir.iterdir()
-            if p.is_dir() and DATE_RE.match(p.name)
-        )
     files: list[Path] = []
-    for d in day_dirs:
+    for d in iter_day_dirs(year_dir, prefix):
         files.extend(scan_day(d))
     return files
 
@@ -301,17 +306,34 @@ def save_state(path: str, state: dict) -> None:
 
 # ---------- media prep ----------
 
+_HEIF_READY: bool | None = None
+
+
+def _heif_ready() -> bool:
+    """Import HEIC support once per run instead of once per file."""
+    global _HEIF_READY
+    if _HEIF_READY is None:
+        try:
+            from pillow_heif import register_heif_opener  # type: ignore
+            register_heif_opener()
+            _HEIF_READY = True
+        except Exception as e:
+            log.warning("HEIC support unavailable (%s); HEIC files get zip-only, no gallery preview", e)
+            _HEIF_READY = False
+    return _HEIF_READY
+
+
 def convert_heic_to_jpeg(src: Path, tmpdir: Path) -> Path | None:
     """Convert HEIC/HEIF to JPEG. Returns path or None on failure."""
-    try:
-        from pillow_heif import register_heif_opener  # type: ignore
-        register_heif_opener()
-        from PIL import Image, ImageOps
-    except Exception as e:
-        log.warning("HEIC support unavailable (%s); will zip %s without gallery preview", e, src.name)
+    if not _heif_ready():
+        log.warning("HEIC support unavailable; will zip %s without gallery preview", src.name)
         return None
     try:
-        from PIL import Image
+        from PIL import Image, ImageOps
+    except Exception as e:
+        log.warning("Pillow unavailable (%s); will zip %s without gallery preview", e, src.name)
+        return None
+    try:
         img = Image.open(src)
         img = ImageOps.exif_transpose(img).convert("RGB")
         # Downscale safety so sendMediaGroup photo stays under ~10MB
@@ -337,8 +359,9 @@ def prepare_gallery_items(files: list[Path], tmpdir: Path) -> tuple[list[dict], 
     notes: list[str] = []
     for f in files:
         ext = f.suffix.lower()
+        size = f.stat().st_size  # single stat per file; missing files raise (caught upstream)
         if ext in PHOTO_EXTS:
-            if f.stat().st_size > PHOTO_MAX_BYTES:
+            if size > PHOTO_MAX_BYTES:
                 notes.append(f"{f.name} skipped in gallery (>10MB photo, still in zip)")
                 continue
             items.append({"kind": "photo", "path": f, "name": f.name})
@@ -349,7 +372,7 @@ def prepare_gallery_items(files: list[Path], tmpdir: Path) -> tuple[list[dict], 
                 continue
             items.append({"kind": "photo", "path": jpg, "name": f"{f.name} (as JPEG)"})
         elif ext in VIDEO_EXTS:
-            if f.stat().st_size > 45 * 1024 * 1024:
+            if size > 45 * 1024 * 1024:
                 notes.append(f"{f.name} too large for gallery wall (still in zip)")
                 continue
             items.append({"kind": "video", "path": f, "name": f.name})
@@ -478,13 +501,23 @@ def post_gallery(tg: Telegram, chat_id: str, label: str, date_s: str,
     return total_chunks
 
 
-def make_zip_and_split(files: list[Path], label: str, date_s: str,
-                       tmpdir: Path, split_mb: float) -> list[Path]:
+def _flat_arcname(f: Path) -> str:
+    return f.name
+
+
+def _day_arcname(f: Path) -> str:
+    """Day-prefixed path so same filenames across days never collide in period zips."""
+    return f"{f.parent.name}/{f.name}"
+
+
+def make_zip_and_split(files: list[Path], label: str, stamp: str,
+                       tmpdir: Path, split_mb: float,
+                       arcname=_flat_arcname) -> list[Path]:
     safe_label = re.sub(r"[^\w\-]+", "_", label)
-    zippath = tmpdir / f"{safe_label}-{date_s}.zip"
-    with zipfile.ZipFile(zippath, "w", zipfile.ZIP_STORED) as zf:
+    zippath = tmpdir / f"{safe_label}-{stamp}.zip"
+    with zipfile.ZipFile(zippath, "w", zipfile.ZIP_STORED, allowZip64=True) as zf:
         for f in files:
-            zf.write(f, arcname=f.name)
+            zf.write(f, arcname=arcname(f))
     limit = int(split_mb * 1024 * 1024)
     size = zippath.stat().st_size
     if size <= limit:
@@ -492,8 +525,16 @@ def make_zip_and_split(files: list[Path], label: str, date_s: str,
     return split_file(zippath, split_mb)
 
 
+_SPLIT_BUF = 8 * 1024 * 1024
+
+
 def split_file(path: Path, split_mb: float) -> list[Path]:
-    """Split file into <=split_mb chunks. Returns [path] untouched if small enough."""
+    """Split file into <=split_mb chunks. Returns [path] untouched if small enough.
+
+    Streams with a fixed 8MB buffer, so peak RAM stays flat instead of
+    scaling with split_mb (previously one whole ~1900MB chunk per read).
+    Output names and contents are unchanged.
+    """
     limit = int(split_mb * 1024 * 1024)
     if path.stat().st_size <= limit:
         return [path]
@@ -501,11 +542,18 @@ def split_file(path: Path, split_mb: float) -> list[Path]:
     with open(path, "rb") as src:
         i = 1
         while True:
-            chunk = src.read(limit)
-            if not chunk:
-                break
             part = path.parent / f"{path.stem}.part{i:03d}"
-            part.write_bytes(chunk)
+            with open(part, "wb") as dst:
+                remaining = limit
+                while remaining > 0:
+                    buf = src.read(min(_SPLIT_BUF, remaining))
+                    if not buf:
+                        break
+                    dst.write(buf)
+                    remaining -= len(buf)
+            if part.stat().st_size == 0:
+                part.unlink(missing_ok=True)
+                break
             parts.append(part)
             i += 1
     path.unlink(missing_ok=True)
@@ -595,6 +643,49 @@ def send_archive_via_userbot(chat_id: str, label: str, date_s: str, part: Path,
 
 # ---------- per user/date run ----------
 
+def deliver_archive(tg: Telegram, cfg: dict, args, label: str, stamp: str,
+                    files: list[Path], tmpdir: Path, arcname=_flat_arcname):
+    """Shared archive pipeline for daily and period uploads.
+
+    Returns (sent, via, total_mb, is_dry_run). In dry-run nothing is
+    transmitted and sent is the estimated part count. Log lines match the
+    historical format exactly.
+    """
+    archive_thread = args.archive_thread if args.archive_thread is not None else cfg["archive_thread_id"]
+    split_mb = args.split_mb or cfg["split_mb"]
+    total_bytes = 0
+    for f in files:
+        total_bytes += f.stat().st_size
+    total_mb = total_bytes / 1024 / 1024
+    if args.dry_run:
+        nparts = max(1, int(-(-total_mb // split_mb))) if split_mb else 1
+        via = choose_archive_sender(total_bytes, cfg, args)
+        log.info("[dry-run] archive %s %s -> chat %s thread %s via %s: %d files, %.1f MB -> ~%d part(s) at %.0fMB",
+                 label, stamp, cfg["archive_chat_id"], archive_thread, via,
+                 len(files), total_mb, nparts, split_mb)
+        return nparts, via, total_mb, True
+    parts = make_zip_and_split(files, label, stamp, tmpdir, split_mb, arcname=arcname)
+    zip_bytes = sum(p.stat().st_size for p in parts)
+    via = choose_archive_sender(zip_bytes, cfg, args)
+    if via == "userbot" and len(parts) == 1:
+        try:
+            sent = send_archive_via_userbot(
+                cfg["archive_chat_id"], label, stamp, parts[0], archive_thread)
+        except Exception as e:
+            log.warning("userbot send failed (%s); falling back to Bot API split", e)
+            sent = post_archive(tg, cfg["archive_chat_id"], label, stamp, parts,
+                                archive_thread, cfg["fallback_split_mb"])
+            via = "bot(fallback)"
+    else:
+        if via == "userbot":
+            # Zip was pre-split above 2GB: Bot API parts it is.
+            log.info("userbot skipped (zip pre-split into %d parts); using Bot API", len(parts))
+            via = "bot"
+        sent = post_archive(tg, cfg["archive_chat_id"], label, stamp, parts,
+                            archive_thread, cfg["fallback_split_mb"])
+    return sent, via, total_mb, False
+
+
 def process_one(tg: Telegram, cfg: dict, state: dict, user_id: str,
                 date_s: str, args) -> str:
     label = user_label(cfg, user_id)
@@ -622,7 +713,6 @@ def process_one(tg: Telegram, cfg: dict, state: dict, user_id: str,
     with tempfile.TemporaryDirectory(prefix="immich-bot-") as tmp:
         tmpdir = Path(tmp)
         gallery_thread = args.gallery_thread if args.gallery_thread is not None else cfg["gallery_thread_id"]
-        archive_thread = args.archive_thread if args.archive_thread is not None else cfg["archive_thread_id"]
         if do_gallery:
             items, notes = prepare_gallery_items(files, tmpdir)
             if args.dry_run:
@@ -635,35 +725,11 @@ def process_one(tg: Telegram, cfg: dict, state: dict, user_id: str,
                 post_gallery(tg, cfg["gallery_chat_id"], label, date_s, items, notes, gallery_thread)
             entry["gallery_done"] = True
         if do_archive:
-            split_mb = args.split_mb or cfg["split_mb"]
-            if args.dry_run:
-                total = sum(f.stat().st_size for f in files) / 1024 / 1024
-                nparts = max(1, int(-(-total // split_mb))) if split_mb else 1
-                via = choose_archive_sender(int(total * 1024 * 1024), cfg, args)
-                log.info("[dry-run] archive %s %s -> chat %s thread %s via %s: %d files, %.1f MB -> ~%d part(s) at %.0fMB",
-                         label, date_s, cfg["archive_chat_id"], archive_thread, via,
-                         len(files), total, nparts, split_mb)
+            sent, via, _total_mb, is_dry = deliver_archive(
+                tg, cfg, args, label, date_s, files, tmpdir)
+            if is_dry:
                 entry["archive_done"] = True  # not persisted in dry-run (see below)
             else:
-                parts = make_zip_and_split(files, label, date_s, tmpdir, split_mb)
-                zip_bytes = sum(p.stat().st_size for p in parts)
-                via = choose_archive_sender(zip_bytes, cfg, args)
-                if via == "userbot" and len(parts) == 1:
-                    try:
-                        sent = send_archive_via_userbot(
-                            cfg["archive_chat_id"], label, date_s, parts[0], archive_thread)
-                    except Exception as e:
-                        log.warning("userbot send failed (%s); falling back to Bot API split", e)
-                        sent = post_archive(tg, cfg["archive_chat_id"], label, date_s, parts,
-                                            archive_thread, cfg["fallback_split_mb"])
-                        via = "bot(fallback)"
-                else:
-                    if via == "userbot":
-                        # Zip was pre-split above 2GB: Bot API parts it is.
-                        log.info("userbot skipped (zip pre-split into %d parts); using Bot API", len(parts))
-                        via = "bot"
-                    sent = post_archive(tg, cfg["archive_chat_id"], label, date_s, parts,
-                                        archive_thread, cfg["fallback_split_mb"])
                 entry["archive_done"] = True
                 entry["archive_parts"] = sent
                 entry["archive_via"] = via
@@ -679,7 +745,8 @@ def process_period(tg: Telegram, cfg: dict, state: dict, user_id: str,
 
     Collects every file under <user>/<YYYY>/<YYYY-MM-DD>/ for the period,
     zips them as <label>-<period>.zip and splits at split_mb (default 1900MB
-    ≈ 2GB max per file). Delivery reuses the daily path: userbot single file
+    ≈ 2GB max per file). Entries are stored as <YYYY-MM-DD>/<filename> so
+    same filenames across days never collide. Delivery reuses the daily path: userbot single file
     over USERBOT_THRESHOLD_MB, else Bot API with FALLBACK_SPLIT_MB retry.
 
     State key is f"{user_id}/{period_s}" (e.g. "uuid/2026-09"), which cannot
@@ -700,35 +767,9 @@ def process_period(tg: Telegram, cfg: dict, state: dict, user_id: str,
 
     with tempfile.TemporaryDirectory(prefix="immich-bot-") as tmp:
         tmpdir = Path(tmp)
-        archive_thread = args.archive_thread if args.archive_thread is not None else cfg["archive_thread_id"]
-        split_mb = args.split_mb or cfg["split_mb"]
-        total_mb = sum(f.stat().st_size for f in files) / 1024 / 1024
-        if args.dry_run:
-            nparts = max(1, int(-(-total_mb // split_mb))) if split_mb else 1
-            via = choose_archive_sender(int(total_mb * 1024 * 1024), cfg, args)
-            log.info("[dry-run] archive %s %s -> chat %s thread %s via %s: %d files, %.1f MB -> ~%d part(s) at %.0fMB",
-                     label, period_s, cfg["archive_chat_id"], archive_thread, via,
-                     len(files), total_mb, nparts, split_mb)
-        else:
-            parts = make_zip_and_split(files, label, period_s, tmpdir, split_mb)
-            zip_bytes = sum(p.stat().st_size for p in parts)
-            via = choose_archive_sender(zip_bytes, cfg, args)
-            if via == "userbot" and len(parts) == 1:
-                try:
-                    sent = send_archive_via_userbot(
-                        cfg["archive_chat_id"], label, period_s, parts[0], archive_thread)
-                except Exception as e:
-                    log.warning("userbot send failed (%s); falling back to Bot API split", e)
-                    sent = post_archive(tg, cfg["archive_chat_id"], label, period_s, parts,
-                                        archive_thread, cfg["fallback_split_mb"])
-                    via = "bot(fallback)"
-            else:
-                if via == "userbot":
-                    # Zip was pre-split above 2GB: Bot API parts it is.
-                    log.info("userbot skipped (zip pre-split into %d parts); using Bot API", len(parts))
-                    via = "bot"
-                sent = post_archive(tg, cfg["archive_chat_id"], label, period_s, parts,
-                                    archive_thread, cfg["fallback_split_mb"])
+        sent, via, total_mb, is_dry = deliver_archive(
+            tg, cfg, args, label, period_s, files, tmpdir, arcname=_day_arcname)
+        if not is_dry:
             entry["archive_done"] = True
             entry["archive_parts"] = sent
             entry["archive_via"] = via
@@ -837,40 +878,26 @@ def main() -> int:
 
     summary: dict[str, int] = {}
     failures: list[str] = []
-    if period_s:
-        for uid in users:
-            label = user_label(cfg, uid)
+    # Single job list preserves the historical order (dates outer, users inner).
+    jobs = ([(uid, period_s, True) for uid in users] if period_s
+            else [(uid, date_s, False) for date_s in dates for uid in users])
+    for uid, stamp, is_period in jobs:
+        label = user_label(cfg, uid)
+        status = None
+        try:
+            status = (process_period(tg, cfg, state, uid, stamp, args) if is_period
+                      else process_one(tg, cfg, state, uid, stamp, args))
+            summary[status] = summary.get(status, 0) + 1
+        except Exception as e:
+            log.exception("[%s %s] FAILED: %s", label, stamp, e)
+            failures.append(f"{label}/{stamp}: {e}")
+        if not args.dry_run and status == "posted":
+            # State only mutates on posted (empty/skipped/failed write nothing).
             try:
-                status = process_period(tg, cfg, state, uid, period_s, args)
-                summary[status] = summary.get(status, 0) + 1
+                save_state(cfg["state_file"], state)
             except Exception as e:
-                log.exception("[%s %s] FAILED: %s", label, period_s, e)
-                failures.append(f"{label}/{period_s}: {e}")
-            if not args.dry_run:
-                try:
-                    save_state(cfg["state_file"], state)
-                except Exception as e:
-                    log.warning("state save failed: %s", e)
-            time.sleep(1)  # gentle pacing across users
-        log.info("Done: %s failures=%d", summary, len(failures))
-        for f in failures:
-            log.error("FAILED: %s", f)
-        return 1 if failures else 0
-    for date_s in dates:
-        for uid in users:
-            label = user_label(cfg, uid)
-            try:
-                status = process_one(tg, cfg, state, uid, date_s, args)
-                summary[status] = summary.get(status, 0) + 1
-            except Exception as e:
-                log.exception("[%s %s] FAILED: %s", label, date_s, e)
-                failures.append(f"{label}/{date_s}: {e}")
-            if not args.dry_run:
-                try:
-                    save_state(cfg["state_file"], state)
-                except Exception as e:
-                    log.warning("state save failed: %s", e)
-            time.sleep(1)  # gentle pacing across users/dates
+                log.warning("state save failed: %s", e)
+        time.sleep(1)  # gentle pacing across users/dates
 
     log.info("Done: %s failures=%d", summary, len(failures))
     for f in failures:

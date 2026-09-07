@@ -24,22 +24,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
-SESSION_PATH = BASE_DIR / "userbot"
 CODE_HASH_PATH = BASE_DIR / ".userbot_code.json"
+
+from userbot_send import SESSION_PATH, load_dotenv  # noqa: E402  (shared session/env)
 
 
 def load_env() -> dict:
-    try:
-        from dotenv import load_dotenv  # type: ignore
-        load_dotenv(BASE_DIR / ".env")
-    except Exception:
-        p = BASE_DIR / ".env"
-        if p.exists():
-            for line in p.read_text().splitlines():
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+    load_dotenv(BASE_DIR / ".env")
     for var in ("API_ID", "API_HASH", "PHONE_NUMBER"):
         if not os.environ.get(var):
             raise SystemExit(f"Missing {var} in .env (get API_ID/API_HASH at https://my.telegram.org/apps)")

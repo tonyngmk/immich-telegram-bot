@@ -27,6 +27,23 @@ class UserbotError(RuntimeError):
     pass
 
 
+def load_dotenv(env_path: Path | None = None) -> None:
+    """Load .env without overriding existing environment (shared with userbot_test)."""
+    p = env_path or BASE_DIR / ".env"
+    try:
+        from dotenv import load_dotenv as _load
+        _load(p)
+        return
+    except Exception:
+        pass
+    if p.exists():
+        for line in p.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+
+
 def _creds() -> tuple[int, str]:
     api_id = os.environ.get("API_ID", "").strip()
     api_hash = os.environ.get("API_HASH", "").strip()

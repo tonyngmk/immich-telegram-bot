@@ -160,8 +160,11 @@ def run_suite(suite: str, seed: int, fast: bool, split_mb: float | None,
         if verbose:
             log.info("gallery sendable=%d notes=%d", len(prep[0]), len(prep[1]))
 
-        # 3. zip (+split inside)
-        parts, dt_zip = timed(bot.make_zip_and_split, files, user, period_s, tmpdir, split)
+        # 3. zip (+split inside). Mirror production: period zips use
+        # day-prefixed entries, daily zips stay flat.
+        arc = bot._day_arcname if suite != "daily" else bot._flat_arcname
+        parts, dt_zip = timed(bot.make_zip_and_split, files, user, period_s,
+                              tmpdir, split, arc)
         stages["zip_split"] = dt_zip
         zip_bytes = sum(p.stat().st_size for p in parts)
         tmp_peak = dir_size(tmpdir)
