@@ -91,6 +91,10 @@ tail -f logs/launchd.out.log logs/bot.log
   `SPLIT_MB` (1900MB ≈ 2GB max per file). A large month/year becomes
   sequential `partNNN` uploads; ensure ~2× the period size in temp disk space.
 - HEIC converts to JPEG (longest side ≤2560, q90). Originals always go in the zip unmodified.
+- Videos transcode to H.264/AAC MP4 with faststart for the gallery wall
+  (iPhone HEVC `.mov` previews poorly on Telegram — black tiles / won't play
+  inline). Needs `ffmpeg` (`brew install ffmpeg`); without it videos go up
+  as-is. Originals always go in the zip unmodified.
 - Videos >45MB skip the gallery wall but stay in the zip (Bot API media-group limit).
 - Telegram's **official Bot API caps bot uploads at ~50MB**, so a day-zip between
   50MB and 2GB is automatically re-split into `FALLBACK_SPLIT_MB` (45MB) parts on

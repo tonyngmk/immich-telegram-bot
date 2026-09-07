@@ -25,6 +25,8 @@ import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -350,13 +352,82 @@ def convert_heic_to_jpeg(src: Path, tmpdir: Path) -> Path | None:
         return None
 
 
+_FFMPEG: str | None | bool = None  # None = unchecked, str = path, False = missing
+
+
+def _ffmpeg() -> str | None:
+    """ffmpeg path if installed (checked once per run), else None."""
+    global _FFMPEG
+    if _FFMPEG is None:
+        _FFMPEG = shutil.which("ffmpeg") or False
+        if _FFMPEG is False:
+            log.warning("ffmpeg not found; gallery videos go up as-is "
+                        "(HEVC .mov often shows black/unplayable — brew install ffmpeg)")
+    return _FFMPEG or None
+
+
+def probe_video_codec(src: Path) -> str | None:
+    """Return the video codec name (e.g. 'h264', 'hevc') via `ffmpeg -i`, or None."""
+    ff = _ffmpeg()
+    if ff is None:
+        return None
+    try:
+        p = subprocess.run([ff, "-hide_banner", "-i", str(src)],
+                           capture_output=True, text=True, timeout=120)
+        m = re.search(r"Video:\s+(\w+)", p.stderr)
+        return m.group(1).lower() if m else None
+    except Exception as e:
+        log.warning("video probe failed for %s: %s", src.name, e)
+        return None
+
+
+VIDEO_PREVIEW_BYTES = 45 * 1024 * 1024
+
+
+def convert_video_for_gallery(src: Path, tmpdir: Path) -> Path | None:
+    """Transcode to H.264/AAC MP4 (faststart) for the gallery wall.
+
+    iPhone .mov files are HEVC, which Telegram previews poorly (black tiles
+    / won't play inline). Originals always stay untouched in archive zips.
+    Returns the MP4 path, or None if unavailable/failed/still too big.
+    """
+    ff = _ffmpeg()
+    if ff is None:
+        return None
+    out = tmpdir / (src.stem + ".mp4")
+    for width in (1280, 640):
+        cmd = [ff, "-hide_banner", "-loglevel", "error", "-y",
+               "-i", str(src),
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+               "-pix_fmt", "yuv420p",
+               "-vf", f"scale=w='min({width},iw)':h=-2",
+               "-c:a", "aac", "-b:a", "128k",
+               "-movflags", "+faststart",
+               str(out)]
+        t0 = time.time()
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=900, check=True)
+        except Exception as e:
+            log.warning("video transcode failed for %s at %dp: %s", src.name, width, e)
+            return None
+        mb = out.stat().st_size / 1024 / 1024
+        log.info("transcoded %s -> %s (%.1f MB, %dp, %.0fs)",
+                 src.name, out.name, mb, width, time.time() - t0)
+        if out.stat().st_size <= VIDEO_PREVIEW_BYTES:
+            return out
+        log.info("%s still %.1f MB at %dp, retrying smaller", src.name, mb, width)
+    log.warning("%s exceeds gallery video cap even at 640p (still in zip)", src.name)
+    return None
+
+
 def prepare_gallery_items(files: list[Path], tmpdir: Path,
-                            convert_heic: bool = True) -> tuple[list[dict], list[str]]:
+                            convert_heic: bool = True,
+                            convert_video: bool = True) -> tuple[list[dict], list[str]]:
     """Return (sendable items, skipped notes).
 
     item = {"kind": "photo"|"video", "path": Path, "name": str}
-    With convert_heic=False (dry-run estimates), HEICs count as sendable
-    without paying for conversion.
+    With convert_heic/convert_video=False (dry-run estimates), HEICs/videos
+    count as sendable without paying for conversion.
     """
     items: list[dict] = []
     notes: list[str] = []
@@ -381,7 +452,20 @@ def prepare_gallery_items(files: list[Path], tmpdir: Path,
             if size > 45 * 1024 * 1024:
                 notes.append(f"{f.name} too large for gallery wall (still in zip)")
                 continue
-            items.append({"kind": "video", "path": f, "name": f.name})
+            if not convert_video or _ffmpeg() is None:
+                if convert_video:
+                    notes.append(f"{f.name} preview as-is (install ffmpeg for MP4 previews)")
+                items.append({"kind": "video", "path": f, "name": f.name})
+                continue
+            if ext == ".mp4" and (probe_video_codec(f) or "") == "h264":
+                items.append({"kind": "video", "path": f, "name": f.name})
+                continue
+            mp4 = convert_video_for_gallery(f, tmpdir)
+            if mp4 is None:
+                notes.append(f"{f.name} transcode failed, sent as-is (still in zip)")
+                items.append({"kind": "video", "path": f, "name": f.name})
+                continue
+            items.append({"kind": "video", "path": mp4, "name": f"{f.name} (as MP4)"})
         else:
             notes.append(f"{f.name} zip-only (unsupported gallery type)")
     return items, notes
@@ -734,7 +818,8 @@ def process_one(tg: Telegram, cfg: dict, state: dict, user_id: str,
         gallery_thread = args.gallery_thread if args.gallery_thread is not None else cfg["gallery_thread_id"]
         if do_gallery:
             items, notes = prepare_gallery_items(files, tmpdir,
-                                                 convert_heic=not args.dry_run)
+                                                 convert_heic=not args.dry_run,
+                                                 convert_video=not args.dry_run)
             if args.dry_run:
                 log.info("[dry-run] gallery %s %s -> chat %s thread %s: %d sendable, %d notes: %s",
                          label, date_s, cfg["gallery_chat_id"], gallery_thread,
