@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.tonyngmk.immich-telegrambot</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/tonyngmk/immich-telegram-bot/.venv/bin/python</string>
+    <string>/Users/tonyngmk/immich-telegram-bot/bot.py</string>
+    <string>--today</string>
+    <string>--all-users</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>23</integer>
+    <key>Minute</key>
+    <integer>55</integer>
+  </dict>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>/Users/tonyngmk/immich-telegram-bot/logs/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/tonyngmk/immich-telegram-bot/logs/launchd.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+</dict>
+</plist>

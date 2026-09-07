@@ -1,0 +1,21 @@
+# Secrets — never commit
+.env
+*.session
+*.session-journal
+
+# Runtime state / logs
+state.json
+logs/
+*.log
+bench.jsonl
+
+# Large test data (GitHub 100MB limit; testdata/ is ~645MB)
+testdata/
+*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store

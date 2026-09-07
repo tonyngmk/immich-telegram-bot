@@ -1,0 +1,5 @@
+requests>=2.31
+Pillow>=10
+pillow-heif>=0.18
+python-dotenv>=1.0
+telethon>=1.36  # userbot sender for archives >50MB (MTProto, 2GB uploads)
