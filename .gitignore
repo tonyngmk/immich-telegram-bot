@@ -8,6 +8,7 @@ state.json
 logs/
 *.log
 bench.jsonl
+.userbot.lock
 
 # Large test data (GitHub 100MB limit; testdata/ is ~645MB)
 testdata/
