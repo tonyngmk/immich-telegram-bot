@@ -368,17 +368,45 @@ def _ffmpeg() -> str | None:
 
 def probe_video_codec(src: Path) -> str | None:
     """Return the video codec name (e.g. 'h264', 'hevc') via `ffmpeg -i`, or None."""
+    return probe_video_info(src).get("codec")
+
+
+HDR_TRANSFERS = ("smpte2084", "st2084", "arib-std-b67")
+
+
+def probe_video_info(src: Path) -> dict:
+    """Probe codec/transfer/Dolby Vision via `ffmpeg -i`.
+
+    Returns {"codec": str|None, "transfer": str|None, "hdr": bool}.
+    hdr covers PQ (smpte2084), HLG (arib-std-b67) and Dolby Vision profiles.
+    """
+    info: dict = {"codec": None, "transfer": None, "hdr": False}
     ff = _ffmpeg()
     if ff is None:
-        return None
+        return info
     try:
         p = subprocess.run([ff, "-hide_banner", "-i", str(src)],
                            capture_output=True, text=True, timeout=120)
-        m = re.search(r"Video:\s+(\w+)", p.stderr)
-        return m.group(1).lower() if m else None
+        err = p.stderr
+        for line in err.splitlines():
+            if "Video:" not in line:
+                continue
+            m = re.search(r"Video:\s+(\w+)", line)
+            if m:
+                info["codec"] = m.group(1).lower()
+            # Pixel-format detail looks like yuv420p10le(tv, bt2020nc/bt2020/arib-std-b67);
+            # the profile paren "(Main 10)" comes first, so scan all groups.
+            for group in re.findall(r"\(([^)]+)\)", line):
+                for tok in (t.strip().lower() for t in group.split("/")):
+                    if tok in HDR_TRANSFERS or tok.startswith("smpte2084"):
+                        info["transfer"] = tok
+            break
+        if info["transfer"] or re.search(r"DOVI configuration record", err):
+            # PQ / HLG transfer or Dolby Vision base layer: needs tone mapping.
+            info["hdr"] = True
     except Exception as e:
         log.warning("video probe failed for %s: %s", src.name, e)
-        return None
+    return info
 
 
 VIDEO_PREVIEW_BYTES = 45 * 1024 * 1024
@@ -388,20 +416,28 @@ def convert_video_for_gallery(src: Path, tmpdir: Path) -> Path | None:
     """Transcode to H.264/AAC MP4 (faststart) for the gallery wall.
 
     iPhone .mov files are HEVC, which Telegram previews poorly (black tiles
-    / won't play inline). Originals always stay untouched in archive zips.
+    / won't play inline). HDR sources (Dolby Vision / HLG / PQ) additionally
+    get software tone mapping (mobius) so the SDR preview doesn't look
+    washed out. Originals always stay untouched in archive zips.
     Returns the MP4 path, or None if unavailable/failed/still too big.
     """
     ff = _ffmpeg()
     if ff is None:
         return None
+    hdr = bool(probe_video_info(src).get("hdr"))
     out = tmpdir / (src.stem + ".mp4")
     for width in (1280, 640):
+        vf = f"scale=w='min({width},iw)':h=-2"
+        if hdr:
+            vf += ",tonemap=mobius:desat=0"
         cmd = [ff, "-hide_banner", "-loglevel", "error", "-y",
                "-i", str(src),
                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
                "-pix_fmt", "yuv420p",
-               "-vf", f"scale=w='min({width},iw)':h=-2",
+               "-vf", vf,
                "-c:a", "aac", "-b:a", "128k",
+               "-colorspace", "bt709", "-color_primaries", "bt709",
+               "-color_trc", "bt709", "-color_range", "tv",
                "-movflags", "+faststart",
                str(out)]
         t0 = time.time()
