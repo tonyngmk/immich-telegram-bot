@@ -11,12 +11,14 @@ import asyncio
 import logging
 import os
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 log = logging.getLogger("immich-bot")
 
 BASE_DIR = Path(__file__).resolve().parent
 SESSION_PATH = BASE_DIR / "userbot"
+LOCK_PATH = BASE_DIR / ".userbot.lock"
 
 # Official Bot API rejects bot uploads over ~50MB (measured cap is the
 # 52,428,800-byte request body). Anything above this goes via userbot in auto.
@@ -25,6 +27,31 @@ BOT_API_UPLOAD_CAP = 50 * 1024 * 1024
 
 class UserbotError(RuntimeError):
     pass
+
+
+@contextmanager
+def _exclusive_lock():
+    """Serialize userbot sends across parallel backfill processes.
+
+    Concurrent Telethon clients on one session file hit SQLite lock errors
+    (and risk connection races), so parallel jobs queue here instead.
+    """
+    try:
+        import fcntl
+    except ImportError:  # non-POSIX: no cross-process lock available
+        yield
+        return
+    LOCK_PATH.touch(exist_ok=True)
+    with open(LOCK_PATH, "w") as lf:
+        try:
+            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            log.info("userbot busy in another job, waiting for lock...")
+            fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
 
 
 def load_dotenv(env_path: Path | None = None) -> None:
@@ -94,6 +121,7 @@ async def send_document_async(chat_id: str | int, path: Path, caption: str,
 
 
 def send_document(chat_id: str | int, path: Path, caption: str,
-                  message_thread_id: int | None = None) -> int:
-    """Sync wrapper for bot.py (runs its own event loop)."""
-    return asyncio.run(send_document_async(chat_id, path, caption, message_thread_id))
+                   message_thread_id: int | None = None) -> int:
+    """Sync wrapper for bot.py (runs its own event loop, lock-serialized)."""
+    with _exclusive_lock():
+        return asyncio.run(send_document_async(chat_id, path, caption, message_thread_id))

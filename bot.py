@@ -350,10 +350,13 @@ def convert_heic_to_jpeg(src: Path, tmpdir: Path) -> Path | None:
         return None
 
 
-def prepare_gallery_items(files: list[Path], tmpdir: Path) -> tuple[list[dict], list[str]]:
+def prepare_gallery_items(files: list[Path], tmpdir: Path,
+                            convert_heic: bool = True) -> tuple[list[dict], list[str]]:
     """Return (sendable items, skipped notes).
 
     item = {"kind": "photo"|"video", "path": Path, "name": str}
+    With convert_heic=False (dry-run estimates), HEICs count as sendable
+    without paying for conversion.
     """
     items: list[dict] = []
     notes: list[str] = []
@@ -366,6 +369,9 @@ def prepare_gallery_items(files: list[Path], tmpdir: Path) -> tuple[list[dict], 
                 continue
             items.append({"kind": "photo", "path": f, "name": f.name})
         elif ext in HEIC_EXTS:
+            if not convert_heic:
+                items.append({"kind": "photo", "path": f, "name": f"{f.name} (as JPEG)"})
+                continue
             jpg = convert_heic_to_jpeg(f, tmpdir)
             if jpg is None:
                 notes.append(f"{f.name} HEIC convert failed (still in zip)")
@@ -628,15 +634,20 @@ def choose_archive_sender(zip_bytes: int, cfg: dict, args) -> str:
     return "bot"
 
 
-def send_archive_via_userbot(chat_id: str, label: str, date_s: str, part: Path,
-                             message_thread_id: int | None) -> int:
-    """Send a single zip via the MTProto user account. Returns 1 document sent."""
+def send_archive_via_userbot(chat_id: str, label: str, stamp: str, part: Path,
+                              message_thread_id: int | None,
+                              part_info: tuple[int, int] | None = None) -> int:
+    """Send a single zip part via the MTProto user account. Returns 1 document sent."""
     try:
         import userbot_send
     except ImportError as e:
         raise RuntimeError(f"userbot unavailable (telethon missing?): {e}")
     mb = part.stat().st_size / 1024 / 1024
-    caption = f"🗄️ <b>{label} — {date_s}</b>  ({mb:.1f} MB, via userbot)"
+    if part_info is not None:
+        i, n = part_info
+        caption = f"🗄️ <b>{label} — {stamp}</b>  part {i}/{n}  ({mb:.1f} MB, via userbot)"
+    else:
+        caption = f"🗄️ <b>{label} — {stamp}</b>  ({mb:.1f} MB, via userbot)"
     userbot_send.send_document(chat_id, part, caption, message_thread_id)
     return 1
 
@@ -667,22 +678,30 @@ def deliver_archive(tg: Telegram, cfg: dict, args, label: str, stamp: str,
     parts = make_zip_and_split(files, label, stamp, tmpdir, split_mb, arcname=arcname)
     zip_bytes = sum(p.stat().st_size for p in parts)
     via = choose_archive_sender(zip_bytes, cfg, args)
-    if via == "userbot" and len(parts) == 1:
-        try:
-            sent = send_archive_via_userbot(
-                cfg["archive_chat_id"], label, stamp, parts[0], archive_thread)
-        except Exception as e:
-            log.warning("userbot send failed (%s); falling back to Bot API split", e)
-            sent = post_archive(tg, cfg["archive_chat_id"], label, stamp, parts,
-                                archive_thread, cfg["fallback_split_mb"])
-            via = "bot(fallback)"
-    else:
-        if via == "userbot":
-            # Zip was pre-split above 2GB: Bot API parts it is.
-            log.info("userbot skipped (zip pre-split into %d parts); using Bot API", len(parts))
-            via = "bot"
+    if via == "bot":
         sent = post_archive(tg, cfg["archive_chat_id"], label, stamp, parts,
                             archive_thread, cfg["fallback_split_mb"])
+        return sent, via, total_mb, False
+    # Userbot path (forced or auto over threshold): one part at a time. Each
+    # part is <= SPLIT_MB (within the ~2GB user upload cap), so multi-GB
+    # periods that pre-split into many parts still deliver. Sends serialize
+    # across parallel jobs via the file lock in userbot_send.
+    sent = 0
+    fell_back = False
+    total_parts = len(parts)
+    for i, part in enumerate(parts, 1):
+        info = (i, total_parts) if total_parts > 1 else None
+        try:
+            sent += send_archive_via_userbot(
+                cfg["archive_chat_id"], label, stamp, part, archive_thread, info)
+        except Exception as e:
+            log.warning("userbot send failed for %s (%s); falling back to Bot API split",
+                        part.name, e)
+            sent += post_archive(tg, cfg["archive_chat_id"], label, stamp, [part],
+                                 archive_thread, cfg["fallback_split_mb"])
+            fell_back = True
+    if fell_back:
+        via = "bot(fallback)" if total_parts == 1 else "userbot+bot(fallback)"
     return sent, via, total_mb, False
 
 
@@ -714,7 +733,8 @@ def process_one(tg: Telegram, cfg: dict, state: dict, user_id: str,
         tmpdir = Path(tmp)
         gallery_thread = args.gallery_thread if args.gallery_thread is not None else cfg["gallery_thread_id"]
         if do_gallery:
-            items, notes = prepare_gallery_items(files, tmpdir)
+            items, notes = prepare_gallery_items(files, tmpdir,
+                                                 convert_heic=not args.dry_run)
             if args.dry_run:
                 log.info("[dry-run] gallery %s %s -> chat %s thread %s: %d sendable, %d notes: %s",
                          label, date_s, cfg["gallery_chat_id"], gallery_thread,
