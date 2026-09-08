@@ -6,9 +6,10 @@ dir and vice versa), so every posted caption names the wrong person. This
 finds all bot-format captions, swaps the label, and rewrites the caption as
 canonical HTML (also repairing any literal `**` markers / skewed entities).
 
-Stored caption forms handled (plain text + entities are ignored and rebuilt):
+Stored caption forms handled (raw server text; NOTE: never use msg.text
+here — Telethon's .text re-renders entities as Markdown ** markers, which is
+what the phantom-asterisk sightings were):
   📸 tony — 2026-09-05  (79 items)         (clean)
-  📸 **tony — 2026-09-05**  (79 items)     (literal markers)
   🗄️ ninnette — 2025  part 3/24  (1900.0 MB[, via userbot])
 
 Usage:
@@ -101,13 +102,14 @@ async def collect(chat: int, limit: int, skip: set, archive_only: bool = False):
         if not await client.is_user_authorized():
             raise SystemExit("userbot session not logged in")
         async for msg in client.iter_messages(chat, limit=limit):
-            if not getattr(msg, "text", None) or msg.id in skip:
+            raw = getattr(msg, "raw_text", None) or getattr(msg, "text", None)
+            if not raw or msg.id in skip:
                 continue
-            if archive_only and not msg.text.startswith("🗄️"):
+            if archive_only and not raw.startswith("🗄️"):
                 continue
-            new = canonical_html(msg.text)
+            new = canonical_html(raw)
             if new is not None:
-                matches.append((msg.id, str(msg.date), msg.text.split("\n")[0][:90], new))
+                matches.append((msg.id, str(msg.date), raw.split("\n")[0][:90], new))
     return matches
 
 

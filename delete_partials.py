@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -61,11 +62,20 @@ async def collect(chat: int, limit: int):
     client = await _connect(api_id, api_hash)
     async with client:
         async for msg in client.iter_messages(chat, limit=limit):
-            if not getattr(msg, "text", None):
+            # raw_text: msg.text re-renders entities as Markdown ** (read artifact).
+            raw = getattr(msg, "raw_text", None) or getattr(msg, "text", None)
+            if not raw:
                 continue
-            parsed = parse_gallery(msg.text)
+            parsed = parse_gallery(raw)
             if parsed is not None:
-                hits.append((msg.id, str(msg.date), msg.text.split("\n")[0][:80]))
+                # (label, stamp, chunk-marker-or-None) for completeness check.
+                lines = raw.split("\n")
+                chunk = None
+                if len(lines) > 1:
+                    m = re.match(r"\((\d+)/(\d+)\)$", lines[-1].strip())
+                    if m:
+                        chunk = (int(m.group(1)), int(m.group(2)))
+                hits.append((msg.id, str(msg.date), lines[0][:80], parsed[0], parsed[1], chunk))
     return hits
 
 
@@ -111,11 +121,27 @@ def main() -> int:
     load_dotenv(BASE_DIR / ".env")
     chat = int(os.environ["ARCHIVE_CHAT_ID"])
     hits = asyncio.run(collect(chat, args.limit))
-    print(f"Matched {len(hits)} partial-chunk messages")
-    for msg_id, date, first in hits[:40]:
-        print(f"  {msg_id} {date} :: {first}")
-    if len(hits) > 40:
-        print(f"  ... and {len(hits) - 40} more")
+    # Group by (label, stamp). A day is complete if it has its final (N/N)
+    # chunk or a single unmarked chunk; only incomplete days get deleted.
+    # (Completeness is judged per label copy — old-mapping duplicates from the
+    # first gallery job, if any survive, are deleted too so days re-post once.)
+    from collections import defaultdict
+    groups: dict = defaultdict(list)
+    for h in hits:
+        groups[(h[3], h[4])].append(h)
+    to_delete = []
+    for key, ms in sorted(groups.items()):
+        chunks = [m[5] for m in ms]
+        if any(c is None for c in chunks):
+            complete = True  # single-chunk day
+        else:
+            complete = any(n == t for n, t in chunks)
+        print(f"  {key[0]} {key[1]}: {len(ms)} msgs, {'COMPLETE keep' if complete else 'PARTIAL delete'}")
+        if not complete:
+            to_delete.extend(ms)
+    print(f"Matched {len(hits)} gallery messages in failed dates; deleting {len(to_delete)}")
+    for msg_id, date, first, _l, _s, _c in to_delete[:40]:
+        print(f"  del {msg_id} {date} :: {first}")
     if args.dry_run:
         # Self-test the parser (accepts clean and **-marked forms).
         assert parse_gallery("📸 tony — 2026-08-29  (50 items)") == ("tony", "2026-08-29")
@@ -124,7 +150,7 @@ def main() -> int:
         assert parse_gallery("🗄️ tony — 2026-08  part 1/2  (1.0 MB)") is None
         print("parser self-test OK")
         return 0
-    ok, failed = asyncio.run(apply(chat, [h[0] for h in hits], args.pause))
+    ok, failed = asyncio.run(apply(chat, [h[0] for h in to_delete], args.pause))
     print(f"Deleted {ok}, failed {failed}")
     return 1 if failed else 0
 
