@@ -573,7 +573,7 @@ class Telegram:
         self.dry_run = dry_run
         self.s = requests.Session()
 
-    def _post(self, method: str, data=None, files=None, retries: int = 4,
+    def _post(self, method: str, data=None, files=None, retries: int = 7,
               files_factory=None):
         """POST with backoff retries. files_factory (callable returning a fresh
         files dict) is used when provided so retries re-open file handles —
@@ -601,9 +601,11 @@ class Telegram:
                     wait = float(r.json().get("parameters", {}).get("retry_after", backoff))
                 except Exception:
                     wait = backoff
-                log.warning("Rate limited, sleeping %.0fs", wait)
+                wait = max(wait, backoff)  # never sleep less than the growing backoff
+                log.warning("Rate limited, sleeping %.0fs (attempt %d/%d)",
+                            wait, attempt, retries)
                 time.sleep(wait)
-                backoff *= 2
+                backoff = min(backoff * 2, 120)
                 continue
             if r.status_code >= 500:
                 log.warning("%s attempt %d HTTP %d", method, attempt, r.status_code)
@@ -712,7 +714,7 @@ def post_gallery(tg: Telegram, chat_id: str, label: str, date_s: str,
         log.info("Sending gallery chunk %d/%d (%d items) for %s %s", n, total_chunks, len(chunk), label, date_s)
         tg.send_media_group(chat_id, chunk, caption, message_thread_id)
         if n < total_chunks:
-            time.sleep(2)
+            time.sleep(5)  # media groups to one chat throttle fast; don't stack 429s
     return total_chunks
 
 
@@ -806,7 +808,7 @@ def post_archive(tg: Telegram, chat_id: str, label: str, date_s: str, parts: lis
             log.info("Sending archive %s (%.1f MB)", part.name, mb)
             tg.send_document(chat_id, part, caption, message_thread_id)
             if i < total:
-                time.sleep(2)
+                time.sleep(5)
 
     try:
         _send_all(parts)
@@ -1127,7 +1129,7 @@ def main() -> int:
                 save_state(cfg["state_file"], state)
             except Exception as e:
                 log.warning("state save failed: %s", e)
-        time.sleep(1)  # gentle pacing across users/dates
+        time.sleep(2)  # gentle pacing across users/dates
 
     log.info("Done: %s failures=%d", summary, len(failures))
     for f in failures:
