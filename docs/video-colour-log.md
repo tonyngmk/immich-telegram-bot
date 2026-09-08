@@ -83,7 +83,7 @@ muting chroma relative to Apple's rendering.
 Gotcha hit while wiring: `sys.executable.resolve()` escapes the venv
 (Homebrew symlink) — helper lookup uses `sys.prefix/bin` instead.
 
-Still open: user eyeball check (TEST 3 — number confirmed below after send). If Apple-mapped still differs from the phone
+Still open: user eyeball check (TEST 3, gallery msg `24352`). If Apple-mapped still differs from the phone
 share-sheet upload, remaining suspects are Telegram server re-encode (#3
 below) and reference ambiguity (#4).
 
