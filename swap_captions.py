@@ -72,12 +72,32 @@ def save_done(ids: set) -> None:
     DONE_FILE.write_text(json.dumps(sorted(ids)))
 
 
-async def collect(chat: int, limit: int, skip: set):
+async def _connect(api_id, api_hash, retries: int = 20, pause: float = 60.0):
+    """Connect with retries: backfill jobs briefly lock the session DB and
+    Telegram itself occasionally 500s (both ride out with backoff)."""
     from telethon import TelegramClient
 
+    last: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            client = TelegramClient(str(SESSION_PATH), api_id, api_hash)
+            await client.connect()
+            return client
+        except Exception as e:
+            last = e
+            if attempt == retries:
+                raise
+            log.warning("connect failed (%s), retry %d/%d in %.0fs",
+                        str(e)[:100], attempt, retries, pause)
+            await asyncio.sleep(pause)
+    raise last  # pragma: no cover
+
+
+async def collect(chat: int, limit: int, skip: set):
     api_id, api_hash = _creds()
     matches = []
-    async with TelegramClient(str(SESSION_PATH), api_id, api_hash) as client:
+    client = await _connect(api_id, api_hash)
+    async with client:
         if not await client.is_user_authorized():
             raise SystemExit("userbot session not logged in")
         async for msg in client.iter_messages(chat, limit=limit):
@@ -110,12 +130,12 @@ def edit_via_bot_api(chat: str, msg_id: int, caption_html: str) -> None:
 
 
 async def apply(chat: int, matches, chat_s: str, pause: float) -> tuple[int, int, set]:
-    from telethon import TelegramClient
     from telethon.errors import FloodWaitError
 
     api_id, api_hash = _creds()
     ok, failed, done_ids = 0, 0, set()
-    async with TelegramClient(str(SESSION_PATH), api_id, api_hash) as client:
+    client = await _connect(api_id, api_hash)
+    async with client:
         for msg_id, _date, _old, new in matches:
             success = False
             for attempt in (1, 2):
