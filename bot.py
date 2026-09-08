@@ -342,6 +342,9 @@ def convert_heic_to_jpeg(src: Path, tmpdir: Path) -> Path | None:
         img.thumbnail((2560, 2560), Image.LANCZOS)
         out = tmpdir / (src.stem + ".jpg")
         img.save(out, "JPEG", quality=90)
+        if out.stat().st_size == 0:
+            log.warning("HEIC convert produced empty file for %s", src.name)
+            return None
         if out.stat().st_size > PHOTO_MAX_BYTES:
             # Second pass, smaller
             img.thumbnail((1920, 1920), Image.LANCZOS)
@@ -466,6 +469,9 @@ def convert_video_for_gallery(src: Path, tmpdir: Path) -> Path | None:
                 log.warning("avconvert failed for %s (%sp): %s",
                             src.name, tier, (r.stderr or "").strip()[-200:])
                 break
+            if out.stat().st_size == 0:
+                log.warning("avconvert produced empty file for %s (%sp)", src.name, tier)
+                break
             mb = out.stat().st_size / 1024 / 1024
             log.info("avconvert %s -> %s (%.1f MB, Apple %sp)", src.name, out.name, mb, tier)
             if out.stat().st_size <= VIDEO_PREVIEW_BYTES:
@@ -519,6 +525,9 @@ def prepare_gallery_items(files: list[Path], tmpdir: Path,
     for f in files:
         ext = f.suffix.lower()
         size = f.stat().st_size  # single stat per file; missing files raise (caught upstream)
+        if size == 0:
+            notes.append(f"{f.name} empty file, zip-only (gallery can't show it)")
+            continue
         if ext in PHOTO_EXTS:
             if size > PHOTO_MAX_BYTES:
                 notes.append(f"{f.name} skipped in gallery (>10MB photo, still in zip)")
@@ -564,20 +573,29 @@ class Telegram:
         self.dry_run = dry_run
         self.s = requests.Session()
 
-    def _post(self, method: str, data=None, files=None, retries: int = 4):
+    def _post(self, method: str, data=None, files=None, retries: int = 4,
+              files_factory=None):
+        """POST with backoff retries. files_factory (callable returning a fresh
+        files dict) is used when provided so retries re-open file handles —
+        re-sending already-consumed handles uploads empty bodies, which
+        Telegram rejects (and worse, could truncate content)."""
         if self.dry_run:
             log.info("[dry-run] would call %s with %s", method, list((data or {}).keys()))
             return {"ok": True, "result": []}
         url = f"https://api.telegram.org/bot{self.token}/{method}"
         backoff = 2.0
         for attempt in range(1, retries + 1):
+            owned = files_factory() if files_factory is not None else None
+            send_files = owned if owned is not None else files
             try:
-                r = self.s.post(url, data=data, files=files, timeout=120)
+                r = self.s.post(url, data=data, files=send_files, timeout=120)
             except requests.RequestException as e:
+                self._close_files(owned)
                 log.warning("%s attempt %d network error: %s", method, attempt, e)
                 time.sleep(backoff)
                 backoff *= 2
                 continue
+            self._close_files(owned)
             if r.status_code == 429:
                 try:
                     wait = float(r.json().get("parameters", {}).get("retry_after", backoff))
@@ -612,11 +630,21 @@ class Telegram:
             return body
         raise RuntimeError(f"{method} failed after {retries} retries")
 
+    @staticmethod
+    def _close_files(files) -> None:
+        if not files:
+            return
+        for v in files.values():
+            try:
+                h = v[1] if isinstance(v, (tuple, list)) else v
+                h.close()
+            except Exception:
+                pass
+
     def send_media_group(self, chat_id: str, items: list[dict], caption: str,
                          message_thread_id: int | None = None) -> None:
         """items: up to 10 {"kind","path"}. Caption attached to first item."""
         media: list[dict] = []
-        files: dict = {}
         for i, it in enumerate(items):
             ref = f"file{i}"
             entry: dict = {"type": it["kind"], "media": f"attach://{ref}"}
@@ -626,35 +654,47 @@ class Telegram:
             if it["kind"] == "video":
                 entry["supports_streaming"] = True
             media.append(entry)
-        # open late so dry-run never touches files unnecessarily (still fine either way)
-        handles = [open(it["path"], "rb") for it in items]
-        try:
-            for i, h in enumerate(handles):
-                files[f"file{i}"] = (items[i]["path"].name, h)
-            data: dict = {"chat_id": chat_id, "media": json.dumps(media)}
-            if message_thread_id is not None:
-                data["message_thread_id"] = str(message_thread_id)
-            self._post("sendMediaGroup", data=data, files=files)
-        finally:
-            for h in handles:
-                try:
-                    h.close()
-                except Exception:
-                    pass
+        data: dict = {"chat_id": chat_id, "media": json.dumps(media)}
+        if message_thread_id is not None:
+            data["message_thread_id"] = str(message_thread_id)
+
+        def factory():
+            # Fresh handles per attempt: retries must not resend consumed ones.
+            return {f"file{i}": (it["path"].name, open(it["path"], "rb"))
+                    for i, it in enumerate(items)}
+
+        self._post("sendMediaGroup", data=data, files_factory=factory)
 
     def send_document(self, chat_id: str, path: Path, caption: str,
                       message_thread_id: int | None = None) -> None:
-        with open(path, "rb") as h:
-            data: dict = {"chat_id": chat_id, "caption": caption[:1024], "parse_mode": "HTML"}
-            if message_thread_id is not None:
-                data["message_thread_id"] = str(message_thread_id)
-            self._post("sendDocument", data=data, files={"document": (path.name, h)})
+        data: dict = {"chat_id": chat_id, "caption": caption[:1024], "parse_mode": "HTML"}
+        if message_thread_id is not None:
+            data["message_thread_id"] = str(message_thread_id)
+
+        def factory():
+            return {"document": (path.name, open(path, "rb"))}
+
+        self._post("sendDocument", data=data, files_factory=factory)
 
 
 def post_gallery(tg: Telegram, chat_id: str, label: str, date_s: str,
                  items: list[dict], notes: list[str],
                  message_thread_id: int | None = None) -> int:
     """Post items in chunks of 10. Returns number of messages (chunks) sent."""
+    # Last line of defense: a 0-byte file fails the whole media group, so
+    # drop any that slipped through (e.g. failed transcode) instead.
+    kept = []
+    for it in items:
+        try:
+            if it["path"].stat().st_size == 0:
+                log.warning("[%s %s] dropping empty gallery file %s", label, date_s, it["name"])
+                notes.append(f"{it['name']} skipped (empty preview)")
+                continue
+        except OSError as e:
+            log.warning("[%s %s] dropping unreadable gallery file %s: %s", label, date_s, it["name"], e)
+            continue
+        kept.append(it)
+    items = kept
     if not items:
         log.info("[%s %s] nothing gallery-sendable (%s)", label, date_s, "; ".join(notes) or "empty")
         return 0
