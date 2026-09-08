@@ -93,7 +93,7 @@ async def _connect(api_id, api_hash, retries: int = 20, pause: float = 60.0):
     raise last  # pragma: no cover
 
 
-async def collect(chat: int, limit: int, skip: set):
+async def collect(chat: int, limit: int, skip: set, archive_only: bool = False):
     api_id, api_hash = _creds()
     matches = []
     client = await _connect(api_id, api_hash)
@@ -102,6 +102,8 @@ async def collect(chat: int, limit: int, skip: set):
             raise SystemExit("userbot session not logged in")
         async for msg in client.iter_messages(chat, limit=limit):
             if not getattr(msg, "text", None) or msg.id in skip:
+                continue
+            if archive_only and not msg.text.startswith("🗄️"):
                 continue
             new = canonical_html(msg.text)
             if new is not None:
@@ -174,6 +176,8 @@ def main() -> int:
     g.add_argument("--apply", action="store_true", help="edit the captions")
     p.add_argument("--limit", type=int, default=8000, help="channel history depth to scan")
     p.add_argument("--pause", type=float, default=0.4, help="seconds between edits")
+    p.add_argument("--archive-only", action="store_true",
+                   help="only touch 🗄️ archive captions (gallery already correct)")
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -183,7 +187,7 @@ def main() -> int:
         raise SystemExit("ARCHIVE_CHAT_ID missing from .env")
 
     done = load_done()
-    matches = asyncio.run(collect(int(chat_s), args.limit, done))
+    matches = asyncio.run(collect(int(chat_s), args.limit, done, args.archive_only))
     print(f"Matched {len(matches)} captioned messages (limit={args.limit}, skipping {len(done)} done)")
     for msg_id, date, old, _new in matches[:30]:
         print(f"  {msg_id} {date} :: {old}")
