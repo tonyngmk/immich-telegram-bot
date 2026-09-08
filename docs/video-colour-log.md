@@ -85,8 +85,8 @@ Gotcha hit while wiring: `sys.executable.resolve()` escapes the venv
 
 Still open: user eyeball check (TEST 3, gallery msg `24352`).
 **Update:** user confirms Attempt 4 "looks very good" — Apple pipeline
-adopted as the gallery video path. TEST 1/2/3 messages left in the gallery
-thread for reference; delete on confirmation. If anything still differs
+adopted as the gallery video path. TEST 1/2/3 messages were removed with
+the gallery-window cleanup; A/B references live in this log's stats table. If anything still differs
 from the phone share-sheet upload, remaining suspects are Telegram server
 re-encode (#3 below) and reference ambiguity (#4).
 
