@@ -62,9 +62,35 @@ is the scene baseline — mobius/reinhard add no extra crush, hable doubles it.)
 - User verdict: better, still slightly off. Test msgs `24307` (Attempt 1) and
   `24309` (Attempt 3) kept in the gallery thread for A/B until confirmed.
 
+## Attempt 4 — Apple's own pipeline via AVFoundation (current)
+
+Rationale: the phone app looks right because it tone-maps on-device with
+Apple's VideoToolbox/HDR pipeline. Instead of imitating that curve with
+ffmpeg software filters, use Apple directly: `tools/avconvert.swift` drives
+`AVAssetExportSession` (720p → 540p fallback, `shouldOptimizeForNetworkUse`
+for faststart). `bot.py` prefers it when built
+(`swiftc -O tools/avconvert.swift -o .venv/bin/avconvert`, override with
+`AVCONVERT_BIN`), falling back to ffmpeg+mobius, then to as-is upload.
+Already-H.264 MP4s still skip re-encoding (probe shortcut).
+
+Measured on the sample: 13.8 MB HEVC-DV → 12 MB H.264 SDR bt709 720x1280
+(portrait kept), ~12 s. Frame stats: mean ~132, 0% blown, crush ≈ baseline —
+but crucially saturation 0.22–0.25 vs 0.11–0.16 for *every* ffmpeg variant.
+That 2× saturation gap is the strongest evidence yet for why mobius looked
+"duller than the phone": software curves preserved luma distribution while
+muting chroma relative to Apple's rendering.
+
+Gotcha hit while wiring: `sys.executable.resolve()` escapes the venv
+(Homebrew symlink) — helper lookup uses `sys.prefix/bin` instead.
+
+Still open: user eyeball check (TEST 3 — number confirmed below after send). If Apple-mapped still differs from the phone
+share-sheet upload, remaining suspects are Telegram server re-encode (#3
+below) and reference ambiguity (#4).
+
 ## Open hypotheses for the residual difference
 
-1. **mobius curve choice.** Hable crushed, reinhard darkened; mobius kept but
+1. **Software curve choice (now fallback-only).** Hable crushed, reinhard
+   darkened; mobius was kept but
    may still differ from Apple's rendering. Untried: `tonemap=clip/gamma/
    linear` blends, `desat` tuning, `peak` semantics for HLG (tonemap's peak
    models PQ nits; HLG nominal peak handling may need `peak` + exposure bias).
@@ -77,17 +103,15 @@ is the scene baseline — mobius/reinhard add no extra crush, hable doubles it.)
    after upload; its converter may shift levels/saturation regardless of what
    we send. Decisive test: upload the *same* MP4 via the official app and
    compare with the bot-posted copy.
-4. **Reference ambiguity.** "Correct" is currently the iPhone Photos rendering
-   (Apple's own DV tone mapping + display processing), which no ffmpeg filter
-   reproduces exactly — residual delta may be irreducible without Apple's pipeline.
+4. **Reference ambiguity.** "Correct" is the iPhone Photos rendering
+   (Apple's own DV tone mapping + display processing). Attempt 4 uses that
+   same Apple pipeline on the Mac side, so any leftover delta likely lives in
+   Telegram's re-encode (#3) or the 720p/H.264 preview compromise (#5).
 5. **10→8-bit + 4:2:0 + CRF 23.** Subtle banding/softness vs original is
    expected; not colour per se, but contributes to "off" feel.
 
 ## Suggested next steps (not yet attempted)
 
-- A/B `mobius` vs `reinhard` vs `mobius+desat` tuning against fixed stills.
-- Get a zscale-capable ffmpeg (`ffmpeg-full` cask or static build) and test
-  the reference chain.
 - Official-app upload of the identical file to isolate Telegram re-encode effects.
 - Ask what specifically still looks off (skin tones? skies? overall warmth?) to
   pick the next knob instead of shooting blind.

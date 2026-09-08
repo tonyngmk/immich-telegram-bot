@@ -355,6 +355,35 @@ def convert_heic_to_jpeg(src: Path, tmpdir: Path) -> Path | None:
 _FFMPEG: str | None | bool = None  # None = unchecked, str = path, False = missing
 
 
+_AVCONVERT: str | bool | None = None  # Apple AVFoundation helper (tools/avconvert.swift)
+
+
+def _avconvert() -> str | None:
+    """avconvert binary path if built, else None (checked once per run).
+
+    Build with: swiftc -O tools/avconvert.swift -o .venv/bin/avconvert
+    Override with AVCONVERT_BIN=/path/to/avconvert.
+    """
+    global _AVCONVERT
+    if _AVCONVERT is None:
+        cands: list[Path] = []
+        env = os.environ.get("AVCONVERT_BIN", "").strip()
+        if env:
+            cands.append(Path(env))
+        try:
+            # sys.prefix is the venv root (resolve() would escape via symlink).
+            cands.append(Path(sys.prefix) / "bin" / "avconvert")
+        except Exception:
+            pass
+        found = next((str(p) for p in cands if p.is_file() and os.access(p, os.X_OK)), None)
+        _AVCONVERT = found or False
+        if found:
+            log.info("avconvert found at %s (Apple video previews on)", found)
+        else:
+            log.info("avconvert not built; Apple video previews off "
+                     "(swiftc -O tools/avconvert.swift -o .venv/bin/avconvert)")
+    return _AVCONVERT or None
+
 def _ffmpeg() -> str | None:
     """ffmpeg path if installed (checked once per run), else None."""
     global _FFMPEG
@@ -416,16 +445,36 @@ def convert_video_for_gallery(src: Path, tmpdir: Path) -> Path | None:
     """Transcode to H.264/AAC MP4 (faststart) for the gallery wall.
 
     iPhone .mov files are HEVC, which Telegram previews poorly (black tiles
-    / won't play inline). HDR sources (Dolby Vision / HLG / PQ) additionally
-    get software tone mapping (mobius) so the SDR preview doesn't look
-    washed out. Originals always stay untouched in archive zips.
+    / won't play inline). Preferred path is Apple's own pipeline (avconvert,
+    AVFoundation export) whose HDR→SDR tone mapping matches what the phone
+    itself produces; ffmpeg+mobius is the fallback. Originals always stay
+    untouched in archive zips.
     Returns the MP4 path, or None if unavailable/failed/still too big.
     """
+    out = tmpdir / (src.stem + ".mp4")
+    av = _avconvert()
+    if av is not None:
+        # Apple presets have no bitrate knob; step down a tier if too big.
+        for tier in ("720", "540"):
+            try:
+                r = subprocess.run([av, str(src), str(out), tier],
+                                   capture_output=True, text=True, timeout=900)
+            except Exception as e:
+                log.warning("avconvert failed for %s (%sp): %s", src.name, tier, e)
+                break
+            if r.returncode != 0:
+                log.warning("avconvert failed for %s (%sp): %s",
+                            src.name, tier, (r.stderr or "").strip()[-200:])
+                break
+            mb = out.stat().st_size / 1024 / 1024
+            log.info("avconvert %s -> %s (%.1f MB, Apple %sp)", src.name, out.name, mb, tier)
+            if out.stat().st_size <= VIDEO_PREVIEW_BYTES:
+                return out
+            log.info("%s still %.1f MB at Apple %sp, retrying smaller", src.name, mb, tier)
     ff = _ffmpeg()
     if ff is None:
         return None
     hdr = bool(probe_video_info(src).get("hdr"))
-    out = tmpdir / (src.stem + ".mp4")
     for width in (1280, 640):
         vf = f"scale=w='min({width},iw)':h=-2"
         if hdr:
@@ -488,9 +537,9 @@ def prepare_gallery_items(files: list[Path], tmpdir: Path,
             if size > 45 * 1024 * 1024:
                 notes.append(f"{f.name} too large for gallery wall (still in zip)")
                 continue
-            if not convert_video or _ffmpeg() is None:
+            if not convert_video or (_ffmpeg() is None and _avconvert() is None):
                 if convert_video:
-                    notes.append(f"{f.name} preview as-is (install ffmpeg for MP4 previews)")
+                    notes.append(f"{f.name} preview as-is (no ffmpeg/avconvert for MP4 previews)")
                 items.append({"kind": "video", "path": f, "name": f.name})
                 continue
             if ext == ".mp4" and (probe_video_codec(f) or "") == "h264":
